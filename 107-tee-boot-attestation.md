@@ -113,18 +113,10 @@ a CVM. That is, CVMs must *attest* their boot environment and prove the
 *integrity* of their workload before any sensitive operations can be performed
 within a CVM.
 
-This enhancement will introduce a new handler to the keylime verifier strictly
-for performing TEE boot attestation. However, with untrusted hosts controlling
-guest memory, certain attacks can take place *before* a guest OS is booted and a
-keylime agent has been initialized. Timing of boot attestation is critical,
-and thus a TEE boot attestation handler cannot assume that it is communicating
-with a keylime agent. Furthermore, the TEE handler will release some secret
-(whether that is a public key to extend an initial TPM measurement with, a LUKS
-key to unlock some initial TPM state, or a combination of both) upon a
-successful boot attestation that will be required for guest OS to boot or a
-keylime agent to start running. In-effect, this handler would essentially
-bootstrap a keylime agent running in a CVM, as the TEE boot environment would
-need to be validated before a keylime agent could begin running.
+This enhancement will introduce the notion of workloads using TEE secure
+processors as their root-of-trust, rather than TPM devices. With this, TPM state
+will be derived from successful TEE attestation reports, and certain TPM PCRs
+will be extended to reflect successful TEE attestation.
 
 ## Motivation
 
@@ -136,9 +128,9 @@ this enhancement.  Describe why the change is important and the benefits to user
 As CVMs are deployed on untrusted systems, it is reasonable to assume that a
 CVM user would also like to take advantage of system integrity monitoring
 provided by keylime *in addition to* TEE technology. That is, it is reasonable
-to expect that keylime agents will be deployed on CVMs. With that, it is
-reasonable to include TEE attestation mechanisms for environments in which
-keylime will already be running for system integrity monitoring purposes.
+to expect that keylime agents will be deployed on CVMs. With that, TEE
+attestation support for environments in which keylime will already be running
+for system integrity monitoring purposes will likely be desired.
 
 ### Goals
 
@@ -146,8 +138,10 @@ keylime will already be running for system integrity monitoring purposes.
 List the specific goals of the enhancement.  What is it trying to achieve?  How will we
 know that this has succeeded?
 -->
- * Extend keylime verifier to include support for TEE boot attestation.
- * Extend TPM measurements to account for TEE boot attestation within keylime.
+ * Extend keylime registrar to perform TEE attestation to bootstrap an agent's
+   TPM state.
+ * On CVMs, extend TPM measurements to account for TEE boot attestation within
+   keylime.
  * Fully support confidential computing systems' need for boot *and* runtime
    attestation within keylime.
 
@@ -178,32 +172,108 @@ the system.  The goal here is to make this feel real for users without getting
 bogged down.
 -->
 
-Initially, the TEE handler will work in-tandem with [SVSM], which runs in
-a tenant's firmware and provides privileged operations for CVM guests. SVSM will
-handle TEE attestation before a guest OS boots. SVSM will be responsible for
-unlocking state (provided by the keylime verifier) needed to begin the guest OS
-boot process.
+With TEE secure processors acting as the ultimate root-of-trust, much of the
+registration and attestation process's behavior should be identical to that of
+if TPM devices were the root of trust. However, some registration steps will be
+handled before the a keylime agent is initialized.
+
+It is critical to establish trust in a CVM as early as possible. As such,
+typical CVMs encrypt their root disks, and require a key stored on an
+attestation server to unlock the root disk and begin running any operating
+systems or applications on the CVM. To get this key from the server, a CVM would
+have to fetch its TEE evidence from the secure processor and send it as input to
+the server. If the server is able to validate the TEE evidence, it will then
+release the key. At this point, CVMs could decrypt their root disks and begin
+running their OS and applications trusting that they are in-fact running
+confidentially.
+
+[SVSM](https://github.com/coconut-svsm/svsm) is a firmware that runs in CVMs and
+is responsible for performing TEE attestation. SVSM performs TEE attestation to
+unlock the CVM's root disk and establish the initial vTPM state. SVSM will
+perform the initial communication with the keylime registrar.
+
+TPMs will be present to ensure the integrity of software running on a CVM (i.e.
+runtime attestation of CVMs). Furthermore, initial vTPM state will be used to
+derive the key to unlock the CVM root disk. Specifically, encrypted VM images
+will be sealed against the initial vTPM state of the CVM. The vTPM state key
+will then be encrypted with a TEE attestation key stored in the keylime
+registrar. Upon CVM boot, the CVM will have access to the encrypted vTPM state
+key. To unlock the root disk, the CVM will need the decrypted vTPM state key.
+The only way for the CVM to decrypt its vTPM state is to attest its TEE evidence
+with the registrar. Upon successful TEE attestation, the registrar will decrypt
+the vTPM state and send it back to the CVM. With this, vTPM state is tied to TEE
+attestation, and vTPM state will need to be available to run any workloads on
+CVMs. Thus, TEE attestation will be required for running any OS/applications and
+initializing TPM state on a CVM.
 
 #### Story 1
- * User launches a confidential VM, pointing it to the URL of the keylime
-   verifier's TEE handler to communicate with for boot attestation.
- * CVM begins running in SVSM. SVSM gathers all necessary information needed for
-   TEE attestation. Information is dependant on the specific TEE architecture
-   the guest is running on top of (ARM CCA, Intel TDX, AMD SEV-SNP, etc...).
- * SVSM sends all attestation information to TEE handler.
- * TEE handler uses information to verify the boot environment.
- * If boot attestation is successful, TEE handler reads the agent's TEE secret
-   from the registrar DB and sends to CVM. If boot attestation fails, TEE
-   handler sends error message.
- * SVSM reads response from TEE handler. If successful, SVSM uses the TEE secret
-   to unlock some state and begin booting guest OS, with a keylime agent
-   eventually initializing and integrity monitoring continuing as normal.
- * SVSM will extend system's TPM state to account for TEE boot attestation.
-   *This is intentially vague at the moment, as the exact design is still under
-   ongoing discussion*.
- * Agent initializes and begins running as normal. Relevant additions are made
-   to verifier to check if TPM measurement includes the data returned from TEE
-   handler. *This is also still under ongoing discussion*.
+
+The use-case of this can be broken up into two main phases, being pre-boot TEE
+attestation and post-boot TPM attestation.
+
+Pre-boot TEE attestation is performed from SVSM to unlock the CVM's root disk
+and establish initial vTPM state for the machine.
+
+Post-boot TPM registration is performed by the keylime agent and no functional
+changes are required. However, the agent enrollment policy will need to account
+for TEE attestation (as will be explained).
+
+Pre-boot Attestation
+--------------------
+
+1. Pre-boot VM Provisioning
+
+As mentioned before, CVM root disks are encrypted, with decryption reliant upon
+successful TEE attestation. In the VM provisioning phase, a user provisions an
+encrypted VM image sealed with vTPM state, which is in-turn encrypted with a key
+stored within keylime. This step involves a new keylime registrar endpoint to
+fetch the public components of its "TEE attestation key" to then encrypt the
+vTPM state.
+
+- User creates an encrypted disk image instance from a plain text image
+  template.
+- User creates vTPM state for the CVM.
+- User seals encrypted disk image key against the vTPM state.
+- User makes POST request to new keylime registrar endpoint to fetch TEE
+  attestation key. Keylime registrar replies with public components of TEE
+  attestation key.
+- User encrypts vTPM state with public TEE attestation key.
+- User stores encrypted vTPM state along with encrypted root disk.
+
+2. Pre-boot VM TEE Attestation
+
+With the image created and the CVM now running, SVSM is able to attest the CVM's
+TEE evidence, unlock its vTPM state, and decrypt its root disk. This step
+involves another new registrar endpoint to perform attestation on the TEE
+evidence.
+
+- SVSM fetches the TEE attestation report from the secure processor.
+- SVSM generates a key pair to receive encrypted results from the attestation
+  server without the host being able to read/snoop on the results.
+- SVSM hashes the public key pair into a part of the TEE attestation report.
+- SVSM POSTs the pre-boot attestation data (TEE report, key pair, wrapped disk
+  key) to the keylime registrar's TEE attestation endpoint.
+- Registrar attests TEE evidence.
+- If TEE attestation successful, registrar decrypts disk key, re-encrypts the
+  disk key with the SVSM key, and sends the re-encrypted key back to SVSM along
+  with a success message. The registrar will also extend one of the vTPMs PCR
+  registers (PCR 0 perhaps, although this is up for debate) to show proof of TEE
+  attestation within the vTPM state itself.
+- If unsuccessful, registrar informs SVSM of attestation failure. SVSM cannot
+  decrypt root disk.
+
+Post-boot Attestation
+---------------------
+
+With the CVM's OS booted and keylime agent started, no functional changes are
+requried by the agent. The agent has a view of the vTPM and will begin the
+keylime registration/activation/enrollment/runtime attestation phases as normal.
+
+However, recall that upon a successful pre-boot TEE attestation, the vTPM state
+will be extended (via a PCR) to show proof of successful pre-boot TEE
+attestation. The agent enrollment policy must account for this PCR extension and
+check for it during the enrollment phase to ensure that the agent's pre-boot
+environment was attested.
 
 ### Notes/Constraints/Caveats (optional)
 
@@ -225,9 +295,9 @@ enhancement ecosystem.
 How will security be reviewed and by whom?
 -->
 
-The TEE handler will contain a very sensitive secret for unlocking some state
-on the CVM. This secret must be properly protected and should only be made
-available to a guest that has successfully attested.
+Keylime will store a TEE attestation key used to encrypt initial vTPM state for
+all encrypted guests attesting with the server. If this key is leaked, all of
+the images could potentially be decrypted and secrets can be leaked.
 
 ## Design Details
 
@@ -237,39 +307,6 @@ change are understandable.  This may include API specs (though not always
 required) or even code snippets.  If there's any ambiguity about HOW your
 proposal will be implemented, this is the place to discuss them.
 -->
-
-The keylime verifier will implement a new handler at `/v_/verify/tee` which can
-be accessed with a `POST` method. The request body is a JSON object with the
-following properties:
-
-- `tee` (_string_) - TEE architecture that the `evidence` will be formatted in.
-- `evidence` (_JSON object_) - TEE evidence. This will be deserialized
-  differently depending on the TEE architecture specified in `tee`.
-- `pubkey_pem` (_string_) - PEM-encoded public key to encrypt the TEE secret
-  with upon a successful attestation.
-
-The RESTful parameters of this handler would also need to include an agent UUID,
-as TEE secrets are specific to each agent.
-
-Upon a `POST` request to the TEE handler, the handler will deserialize the
-request body from JSON to fetch the parameters listed above. The handler will
-read the `tee` parameter and deserialize the `evidence` parameter accordingly.
-
-The handler will attest the TEE `evidence`. If successful, the handler will use
-the `agent_uuid` from the RESTful parameters, read the agent's TEE secret from
-the registrar, and encrypt the secret with the public key found from
-`pubkey_pem` in the request body's JSON object.
-
-SVSM will decrypt the resource and use it to unlock some state within the
-firmware of the CVM. With that, it will be able to begin the guest OS boot
-process.
-
-*PROBABLE*: SVSM will extend its TPM measurement with some state (be it a public
-key or certificate) provided by keylime. This will essentially require and
-include the TEE boot attestation to be accounted for within an actual TPM
-measurement checked at a later point within the keylime verifier. The design of
-this is still under ongoing discussion, and this document will be updated when
-the design is complete.
 
 
 ### Test Plan
